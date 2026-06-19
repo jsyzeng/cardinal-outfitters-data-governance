@@ -83,6 +83,26 @@ def lf_backend() -> str:
         return "local"
 
 
+def make_catalog(db_path: str = "cardinal.db"):
+    """Return the governance engine for the active backend (Step 0 uses this).
+
+    - Live AWS (CARDINAL_LF_LIVE=1 + awswrangler + credentials) -> AwsGovernedCatalog,
+      which performs real AWS Glue / Lake Formation / Athena operations for MP2, MP7, MP9.
+    - Otherwise -> the local GovernedCatalog (SQLite engine) so the notebook always runs;
+      this is the authoring/offline fallback, not the graded learner path.
+
+    The two share one method surface, so the notebook cells are identical either way.
+    """
+    if lf_backend() == "live":
+        try:
+            from aws_backend import AwsGovernedCatalog
+            return AwsGovernedCatalog(db_path)
+        except Exception as e:   # pragma: no cover - live-only
+            print(f"[make_catalog] live AWS backend unavailable ({e}); "
+                  f"falling back to the local engine.")
+    return GovernedCatalog(db_path)
+
+
 # ============================================================================= #
 # Grant model
 # ============================================================================= #
@@ -155,6 +175,34 @@ class GovernedCatalog:
 
     def semantic_conflicts(self) -> pd.DataFrame:
         return pd.DataFrame(self.catalog.semantic_conflicts)
+
+    def set_table_metadata(self, table: str, owner: str | None = None,
+                           classification: str | None = None,
+                           retention: str | None = None) -> None:
+        """Write table-level governance metadata to the catalog (Step 2 remediation).
+
+        Only the arguments you pass are updated; the rest are left as-is. Under the AWS
+        backend this calls Glue UpdateTable (table Parameters); locally it updates the
+        in-memory Glue-analog catalog. Either way, a follow-up catalog_audit() reflects it.
+        """
+        tm = self.catalog.table(table)
+        if owner is not None:
+            tm.owner = owner
+        if classification is not None:
+            tm.classification = classification
+        if retention is not None:
+            tm.retention = retention
+
+    def tag_column(self, table: str, column: str, classification: str) -> None:
+        """Set a column's classification in the catalog (Step 2 PII tagging).
+
+        Under the AWS backend this writes the column's Glue parameter; locally it updates
+        the in-memory catalog. Used to tag an untagged PII column (e.g. customer.phone).
+        """
+        col = self.catalog.table(table).column(column)
+        if col is None:
+            raise ValueError(f"table {table!r} has no column {column!r}")
+        col.classification = classification
 
     # ---- Step 7: Lake Formation grants -------------------------------------- #
 
@@ -316,6 +364,19 @@ class GovernedCatalog:
     def _table_has_tag(self, table: str, tag_grants: set[tuple[str, str]]) -> bool:
         tm = self.catalog.table(table)
         return any((k, v) in tag_grants for k, v in tm.lf_tags.items())
+
+    def _table_access_governed(self, table: str) -> bool:
+        """True if some Lake Formation grant or LF-Tag governs access to `table`.
+
+        A PII-bearing table with neither is effectively wide open — the access-control
+        gap the Step 9 governance audit flags. Works on the in-memory grant mirror, which
+        the AWS backend keeps in sync as it applies real Lake Formation grants.
+        """
+        if any(table in g.table_grants for g in self._grants.values()):
+            return True
+        if self.catalog.table(table).lf_tags:
+            return True
+        return False
 
     # ---- Step 4: quality ---------------------------------------------------- #
 
@@ -666,6 +727,17 @@ def governance_audit(gc: GovernedCatalog, contracts_valid: bool | None = None) -
     findings.append({"signal": "consent_conflict",
                      "object": "customer.marketing_consent vs campaign_membership.mkt_consent",
                      "severity": "high", "source": "semantic_conflicts (MP2)"})
+
+    # 6. access-control gaps: any PII-bearing table with no Lake Formation restriction.
+    # After MP7 governs `customer`, this surfaces the *other* PII table (campaign_membership,
+    # which holds cust_ref = email) so MP9 has a real access remediation to perform in AWS.
+    for t in gc.tables():
+        tm = gc.catalog.table(t)
+        is_pii = (tm.classification == "PII") or any(c.classification == "PII" for c in tm.columns)
+        if is_pii and not gc._table_access_governed(t):
+            findings.append({"signal": "access_control_gap",
+                             "object": f"{t} (PII table, no Lake Formation restriction)",
+                             "severity": "high", "source": "lake formation (MP7)"})
 
     return pd.DataFrame(findings)
 

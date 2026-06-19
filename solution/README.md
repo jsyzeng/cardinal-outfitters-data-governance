@@ -9,27 +9,31 @@ written to a "Meets/Exceeds" standard, executed top-to-bottom with outputs.
 | File | What it is |
 |---|---|
 | `project.ipynb` | The completed answer key, executed with outputs. |
-| `governance_toolkit.py` | Provided governance engine (catalog, Lake Formation grants, query-as-persona, quality, lineage, MDM, reporting, audit). Identical to the learner's copy. |
+| `governance_toolkit.py` | Provided governance engine + `make_catalog()` factory. Identical to the learner's copy. |
+| `aws_backend.py` | Provided live AWS backend (real Glue / Lake Formation / Athena for Steps 2, 7, 9). |
+| `setup_aws.py` | Provisioner seeder (Glue DB + S3 data with the deliberate gaps). |
+| `requirements.txt` | Python dependencies. |
 | `seed_data.py` | Provided deterministic four-domain seed. Identical to the learner's copy. |
 | `terraform/governed-data-product/main.tf` | Provided read-only IaC module read in Step 7. |
 
 ## Run / re-execute
 
 ```
-pip install pandas jsonschema pyyaml jupyterlab
+pip install -r requirements.txt
+export CARDINAL_LF_LIVE=1     # to re-execute against live AWS; omit for the local fallback
 jupyter lab project.ipynb           # to inspect interactively
 ```
 
 The seed is deterministic (`SEED=42`), so every run yields identical data and outputs —
-reviewers see exactly what the learner sees. Re-running the notebook rebuilds the local lake
-(`cardinal.db`) from scratch.
+reviewers see exactly what the learner sees. Re-running the notebook rebuilds the platform from
+scratch.
 
-> **Hybrid backend.** `query_as()` (Step 7) uses live AWS Lake Formation + Athena when the
-> environment provides per-persona assume-role; otherwise it enforces locally via scoped
-> SQLite views. The local path is the default and requires no AWS account. To force the live
-> path: `export CARDINAL_LF_LIVE=1` with AWS credentials and the persona role ARNs set in
-> `governance_toolkit.PERSONAS`. `lf_backend()` reports the active path. The graded outcomes
-> are identical under either backend.
+> **Backend.** Step 0's `make_catalog()` returns the **live AWS engine** when the lab is
+> provisioned — Steps 2 (Glue), 7 (Lake Formation + Athena, per-persona assume-role), and 9
+> (governance audit/remediation) run against real AWS — otherwise an equivalent **local engine**
+> (scoped SQLite views) so reviewers can re-execute offline. The graded path is AWS;
+> `lf_backend()` reports the active path. Provisioning is specified in the capstone
+> `environment-provisioning-request.md`; seed an account with `python3 setup_aws.py`.
 
 ## What the solution demonstrates per step
 

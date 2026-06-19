@@ -15,19 +15,21 @@ domains under simultaneous **GDPR** and **CSRD** pressure. Across ten steps they
 catalog metadata, encode obligations in a data contract, interpret data quality, steward
 master data, read lineage and specify monitoring, enforce Lake Formation access for four
 personas, verify cross-domain reporting traceability, stand up governance operations, and
-write an architect's brief. It is a judgment project (~5 hours): the learner runs provided
-tooling and produces decision-oriented artifacts.
+write an architect's brief. It is a judgment project with **hands-on AWS** (~7 hours): three
+steps run against real AWS — **Glue** (Step 2), **Lake Formation + Athena** (Step 7), and a
+live **governance audit/remediation** (Step 9) — while the rest are decision-oriented.
 
 ## Running the solution
 
 ```
-pip install pandas jsonschema pyyaml jupyterlab
+pip install -r solution/requirements.txt
 cd solution
+export CARDINAL_LF_LIVE=1     # to re-execute against live AWS; omit for the local fallback
 jupyter lab project.ipynb
 ```
 
-`solution/project.ipynb` is the **answer key**, executed with expected outputs. It runs
-locally with no AWS account (see the hybrid-backend note in `solution/README.md`).
+`solution/project.ipynb` is the **answer key**, executed with expected outputs. The graded path
+is live AWS; it also runs locally as a fallback (see the backend note in `solution/README.md`).
 
 ## Mapping to the rubric
 
@@ -41,7 +43,10 @@ for every criterion — in particular, the Step 7 verification table shows all f
 | Path | Purpose |
 |---|---|
 | `solution/project.ipynb` | Completed, executed answer key |
-| `solution/governance_toolkit.py` | Provided governance engine |
+| `solution/governance_toolkit.py` | Provided governance engine + `make_catalog()` backend factory |
+| `solution/aws_backend.py` | Provided live AWS backend (Glue / Lake Formation / Athena; Steps 2, 7, 9) |
+| `solution/setup_aws.py` | Provisioner seeder (Glue DB + S3 data) |
+| `solution/requirements.txt` | Python dependencies |
 | `solution/seed_data.py` | Provided deterministic seed |
 | `solution/terraform/governed-data-product/main.tf` | Provided read-only IaC (Step 7) |
 | `Project_Creation_Guidance.md` | Udacity project-design standards |
