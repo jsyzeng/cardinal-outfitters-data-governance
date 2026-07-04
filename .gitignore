@@ -1,1 +1,10 @@
+# Python / notebook run artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local data lake rebuilt by running the notebook
+*.db
+
+# OS
 .DS_Store
