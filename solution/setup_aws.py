@@ -49,13 +49,17 @@ def main() -> None:
     database = _cfg("CARDINAL_GLUE_DATABASE", catalog.database)
     s3_data = _cfg("CARDINAL_S3_DATA", f"s3://{account_id}-{database}-data").rstrip("/")
 
-    # 1. database
+    # 1. database. CreateTableDefaultPermissions=[] stops new tables in *this* database
+    # from inheriting the catalog-wide IAMAllowedPrincipals:ALL default (step 2 below also
+    # revokes it on tables created before this flag existed / in hybrid-mode accounts).
     try:
-        glue.create_database(DatabaseInput={"Name": database,
-                                            "Description": "Cardinal Outfitters governed platform"})
+        glue.create_database(DatabaseInput={
+            "Name": database, "Description": "Cardinal Outfitters governed platform",
+            "CreateTableDefaultPermissions": []})
         print(f"created Glue database {database!r}")
     except glue.exceptions.AlreadyExistsException:
         print(f"Glue database {database!r} already exists")
+    _revoke_iam_allowed_principals(lf, account_id, database)
 
     # 2. tables: write parquet + register, then stamp the deliberate-gap metadata
     for name, tm in catalog.tables.items():
@@ -64,6 +68,10 @@ def main() -> None:
         wr.s3.to_parquet(df=df, path=path, dataset=True, mode="overwrite",
                          database=database, table=name, boto3_session=session)
         _apply_catalog_metadata(glue, database, name, tm)
+        # IAMAllowedPrincipals:ALL is granted per-table at creation time (from the catalog
+        # default above), bypassing every Lake Formation grant Step 7 applies -- must be
+        # revoked per table, not just on the database.
+        _revoke_iam_allowed_principals(lf, account_id, database, name)
         gaps = [a for a in ("owner", "classification", "retention") if getattr(tm, a) is None]
         untagged = [c.name for c in tm.columns if c.classification is None]
         print(f"  {name:22} rows={len(df):5d}  table-gaps={gaps}  untagged-cols={untagged}")
@@ -76,8 +84,29 @@ def main() -> None:
     except lf.exceptions.AlreadyExistsException:
         print(f"{s3_data} already registered with Lake Formation")
 
-    print("\nDone. Confirm: IAMAllowedPrincipals default grants are OFF on this database "
-          "(provisioning-request §7), persona roles exist, and the notebook role is LF admin.")
+    print("\nDone. IAMAllowedPrincipals default grants revoked on the database and every "
+          "table (provisioning-request §7); persona roles and notebook-role LF admin are "
+          "assumed pre-provisioned by Vocareum.")
+
+
+def _revoke_iam_allowed_principals(lf, account_id: str, database: str, table: str | None = None) -> None:
+    """Best-effort revoke of the legacy IAMAllowedPrincipals:ALL grant.
+
+    Glue's catalog-wide CreateDatabaseDefaultPermissions / CreateTableDefaultPermissions
+    commonly default to granting the pseudo-principal IAM_ALLOWED_PRINCIPALS "ALL" on every
+    newly created database/table. While that grant is in effect, Lake Formation does not
+    enforce fine-grained permissions on the resource at all -- any principal whose IAM policy
+    allows the underlying Glue/S3 actions gets full, unfiltered access, silently defeating
+    every column/row/tag grant Step 7 applies. Revoking it is a no-op if it was never granted.
+    """
+    resource = ({"Table": {"CatalogId": account_id, "DatabaseName": database, "Name": table}}
+                if table else {"Database": {"CatalogId": account_id, "Name": database}})
+    try:
+        lf.revoke_permissions(
+            Principal={"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"},
+            Resource=resource, Permissions=["ALL"])
+    except Exception:
+        pass  # nothing to revoke
 
 
 def _apply_catalog_metadata(glue, database: str, name: str, tm) -> None:
@@ -88,10 +117,15 @@ def _apply_catalog_metadata(glue, database: str, name: str, tm) -> None:
           if k in resp["Table"]}
     params = ti.setdefault("Parameters", {})
     params["domain"] = tm.domain
+    # "classification" collides with awswrangler's own file-format Parameter (it stamps
+    # every table "classification": "parquet"), so the governance value goes under a
+    # distinct key -- must match AwsGovernedCatalog._GOVERNANCE_CLASSIFICATION_KEY.
+    param_key = {"owner": "owner", "classification": "governance_classification",
+                 "retention": "retention"}
     for attr in ("owner", "classification", "retention"):
         val = getattr(tm, attr)
         if val is not None:                       # leave gaps unset on purpose
-            params[attr] = val
+            params[param_key[attr]] = val
     for col in ti.get("StorageDescriptor", {}).get("Columns", []):
         meta = tm.column(col["Name"])
         if meta is not None and meta.classification is not None:

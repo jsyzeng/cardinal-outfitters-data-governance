@@ -105,6 +105,15 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
                 break
         return tables
 
+    # Table-level governance classification is stored under this Glue Parameter key,
+    # NOT "classification": awswrangler's to_parquet(dataset=True, table=...) already
+    # stamps every table with Parameters["classification"] = "parquet" (its own file-format
+    # marker), which would otherwise make every table look governance-classified from the
+    # moment it's written, hiding real missing_classification gaps. Column-level Parameters
+    # don't have this collision (awswrangler doesn't set a per-column "classification"), so
+    # tag_column() below keeps using "classification" at the column level unchanged.
+    _GOVERNANCE_CLASSIFICATION_KEY = "governance_classification"
+
     def catalog_audit(self) -> pd.DataFrame:
         """One row per governance gap, read live from Glue table & column Parameters."""
         rows = []
@@ -113,8 +122,10 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
             name = tbl["Name"]
             params = tbl.get("Parameters", {})
             domain = params.get("domain", domain_of.get(name, "(unknown)"))
-            for attr in ("owner", "classification", "retention"):
-                if not params.get(attr):
+            for attr, param_key in (("owner", "owner"),
+                                    ("classification", self._GOVERNANCE_CLASSIFICATION_KEY),
+                                    ("retention", "retention")):
+                if not params.get(param_key):
                     rows.append({"table": name, "domain": domain,
                                  "gap_type": f"missing_{attr}", "detail": attr})
             for col in tbl.get("StorageDescriptor", {}).get("Columns", []):
@@ -129,7 +140,9 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
         resp = self.glue.get_table(DatabaseName=self.database, Name=table)
         ti = _strip_table_input(resp["Table"])
         params = ti.setdefault("Parameters", {})
-        for k, v in (("owner", owner), ("classification", classification), ("retention", retention)):
+        for k, v in (("owner", owner),
+                     (self._GOVERNANCE_CLASSIFICATION_KEY, classification),
+                     ("retention", retention)):
             if v is not None:
                 params[k] = v
         self.glue.update_table(DatabaseName=self.database, TableInput=ti)
@@ -191,6 +204,15 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
             self.lf.create_lf_tag(TagKey=key, TagValues=[value])
         except self.lf.exceptions.AlreadyExistsException:
             pass
+        except self.lf.exceptions.InvalidInputException as e:
+            # LF raises InvalidInputException (not AlreadyExistsException) when the tag
+            # key already exists, e.g. the same key assigned to a second table/step.
+            if "already exist" not in str(e).lower():
+                raise
+            try:
+                self.lf.update_lf_tag(TagKey=key, TagValuesToAdd=[value])
+            except self.lf.exceptions.InvalidInputException:
+                pass  # value already present on the tag
         self.lf.add_lf_tags_to_resource(
             Resource=self._table_resource(table),
             LFTags=[{"CatalogId": self.account_id, "TagKey": key, "TagValues": [value]}])
@@ -205,6 +227,13 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
 
     def grant_describe_only(self, role) -> None:
         super().grant_describe_only(role)  # mirror
+        # Athena must resolve the database to plan a DESCRIBE/SELECT, so DESCRIBE on the
+        # database is required in addition to DESCRIBE on each table -- table-only leaves
+        # every query failing with "Insufficient Lake Formation permission(s)".
+        self.lf.grant_permissions(
+            Principal=self._principal(role),
+            Resource={"Database": {"CatalogId": self.account_id, "Name": self.database}},
+            Permissions=["DESCRIBE"])
         for t in self.tables():
             self.lf.grant_permissions(
                 Principal=self._principal(role),
@@ -254,6 +283,10 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
                                           "Expression": [{"TagKey": key, "TagValues": [value]}]}},
                 Permissions=["SELECT", "DESCRIBE"]))
         if g.describe_only:
+            _safe(lambda: self.lf.revoke_permissions(
+                Principal=p,
+                Resource={"Database": {"CatalogId": self.account_id, "Name": self.database}},
+                Permissions=["DESCRIBE"]))
             for t in self.tables():
                 _safe(lambda: self.lf.revoke_permissions(
                     Principal=p, Resource=self._table_resource(t), Permissions=["DESCRIBE"]))
@@ -265,6 +298,9 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
     def _query_as_live(self, role: str, sql: str) -> pd.DataFrame:
         import awswrangler as wr
         import boto3
+
+        from governance_toolkit import _is_describe
+
         creds = self.sts.assume_role(
             RoleArn=self.personas[role], RoleSessionName=f"capstone-{role}")["Credentials"]
         sess = boto3.Session(region_name=self.region,
@@ -272,15 +308,64 @@ class AwsGovernedCatalog(GovernedCatalog):  # pragma: no cover - live AWS only
                              aws_secret_access_key=creds["SecretAccessKey"],
                              aws_session_token=creds["SessionToken"])
         try:
+            if _is_describe(sql):
+                # DESCRIBE/SHOW COLUMNS results come back as one tab-packed text value per
+                # row (no real CSV header), which breaks awswrangler's CSV-based result
+                # parser (it silently returns zero columns) -- parse the raw Athena rows.
+                return self._describe_live(sess, sql)
+            # ctas_approach=False: awswrangler's default CTAS path creates (then drops) a
+            # temporary Glue table to stage results, which needs glue:CreateTable/DeleteTable
+            # -- permissions a least-privilege persona role intentionally does not have. The
+            # non-CTAS path only needs StartQueryExecution/GetQueryResults + the Lake
+            # Formation-vended S3 read, which the persona policy already grants.
             return wr.athena.read_sql_query(
                 sql, database=self.database, workgroup=self.athena_workgroup,
-                s3_output=self.results_bucket, boto3_session=sess)
+                s3_output=self.results_bucket, boto3_session=sess, ctas_approach=False)
         except Exception as e:
-            # Lake Formation / Athena denials surface as a query error -> AccessDenied,
-            # so verify_step7's auditor SELECT-denied check works against real enforcement.
-            if "AccessDenied" in str(e) or "not authorized" in str(e).lower():
+            # Lake Formation / Athena denials surface as a query error, in several wordings
+            # depending on WHAT is denied: a flat-out AccessDeniedException from Glue/LF
+            # before the query even runs, or (for a persona granted zero columns, e.g. the
+            # metadata-only auditor) Presto's "Relation contains no accessible columns" once
+            # Athena runs the query. Recognize all of them so verify_step7's denial checks
+            # test real live enforcement instead of silently falling back to the local engine.
+            msg = str(e).lower()
+            denial_markers = ("accessdenied", "not authorized", "access denied",
+                              "insufficient lake formation permission",
+                              "no accessible columns", "permission denied")
+            if any(m in msg for m in denial_markers):
                 raise AccessDenied(f"{role}: {e}") from None
             raise
+
+    def _describe_live(self, sess, sql: str) -> pd.DataFrame:
+        """Run a DESCRIBE/SHOW COLUMNS statement and parse Athena's raw result rows.
+
+        Each row comes back as a single tab-padded string (col_name, data_type, comment),
+        not separate fields -- split on whitespace runs and build the DataFrame by hand.
+        """
+        import time
+
+        athena = sess.client("athena")
+        qid = athena.start_query_execution(
+            QueryString=sql, QueryExecutionContext={"Database": self.database},
+            WorkGroup=self.athena_workgroup,
+            ResultConfiguration={"OutputLocation": self.results_bucket})["QueryExecutionId"]
+        for _ in range(60):
+            status = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+            if status["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                break
+            time.sleep(0.5)
+        if status["State"] != "SUCCEEDED":
+            raise RuntimeError(status.get("StateChangeReason", status["State"]))
+
+        rows = []
+        paginator = athena.get_paginator("get_query_results")
+        for page in paginator.paginate(QueryExecutionId=qid):
+            for row in page["ResultSet"]["Rows"]:
+                raw = row["Data"][0].get("VarCharValue", "")
+                parts = [p.strip() for p in raw.split("\t")]
+                parts = (parts + ["", "", ""])[:3]   # pad/truncate to exactly 3 fields
+                rows.append(parts)
+        return pd.DataFrame(rows, columns=["col_name", "data_type", "comment"])
 
 
 def _strip_table_input(table: dict) -> dict:

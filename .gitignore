@@ -8,3 +8,10 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Secrets / local env
+AWS_secrets.txt
+.venv/
+
+# Verification artifacts from this review session
+solution/executed_project.ipynb
